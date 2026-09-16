@@ -1545,12 +1545,19 @@ class PlaybackService : MediaLibraryService() {
         }
 
         OriginalVersion.pin(song.videoId)
+        QualityUpgrade.forget(song.videoId)
+        StreamChoice.forget(song.videoId)
+        NerdStats.clearDeclared(song.videoId)
+        NerdStats.recordSource(song.videoId, "YouTube")
         val position = activePlayer.currentPosition
         val wasPlaying = activePlayer.isPlaying
         swappingMediaId = song.videoId
         activePlayer.replaceMediaItem(index, song.toDirectYouTubeMediaItem())
         activePlayer.seekTo(index, position)
         if (wasPlaying) activePlayer.play()
+        if (index < 0 || index == activePlayer.currentMediaItemIndex) {
+            publishNerdStats()
+        }
         mediaSession?.setCustomLayout(notificationButtons())
     }
 
@@ -3020,6 +3027,7 @@ class PlaybackService : MediaLibraryService() {
             // NerdStats cleanup for why the pre-upgrade claim has to be
             // captured here rather than looked up again on revert.
             val previousFormat = NerdStats.declaredFormat(mediaId)
+            val previousSource = currentSourceName(mediaId, now.item) ?: "YouTube"
             swappingMediaId = mediaId
             swapCutAt = SystemClock.elapsedRealtime()
             val upgradedMetadata = now.item.mediaMetadata.buildUpon()
@@ -3038,8 +3046,14 @@ class PlaybackService : MediaLibraryService() {
             player.seekTo(player.currentMediaItemIndex, now.position)
             player.prepare()
             QualityUpgrade.unshelve(mediaId)
-            TrackLog.d("BitChord", "upgraded to ${stream.format.summary} at ${now.position}ms")
-            watchUpgrade(mediaId, now.uri, now.position, now.duration, previousFormat)
+            val newSource = stream.sourceConfigId?.let {
+                SourceRegistry.config(it)?.displayName ?: it.replaceFirstChar(Char::titlecase)
+            } ?: "Upgrade"
+            NerdStats.onSourceStream(mediaId, stream.format, newSource)
+            NerdStats.recordSource(mediaId, newSource)
+            publishNerdStats()
+            TrackLog.d("BitChord", "upgraded to ${stream.format.summary} at ${now.position}ms from $newSource")
+            watchUpgrade(mediaId, now.uri, now.position, now.duration, previousFormat, previousSource)
             if (QualityUpgrade.continueAfterLossySwap(mediaId)) {
                 // The immediate JioSaavn improvement stays audible while a
                 // slower lossless source is checked against its higher-quality
@@ -3386,6 +3400,7 @@ class PlaybackService : MediaLibraryService() {
         position: Long,
         previousDuration: Long,
         previousFormat: StreamFormat?,
+        previousSource: String = "YouTube",
     ) {
         if (previousDuration <= 0) return
         scope.launch(TrackLog.about(mediaId)) {
@@ -3427,11 +3442,10 @@ class PlaybackService : MediaLibraryService() {
             // keep calling the fallback lossless after the upgrade it
             // borrowed that claim from got reverted.
             if (previousFormat != null) {
-                val prevSource = StreamChoice.of(mediaId)?.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
-                    ?: if (StreamChoice.isSubstitute(mediaId)) "Module" else "YouTube"
-                NerdStats.onSourceStream(mediaId, previousFormat, prevSource)
+                NerdStats.onSourceStream(mediaId, previousFormat, previousSource)
             } else {
                 NerdStats.clearDeclared(mediaId)
+                NerdStats.recordSource(mediaId, previousSource)
             }
             swappingMediaId = mediaId
             val abandoned = item.localConfiguration?.uri
@@ -3441,6 +3455,7 @@ class PlaybackService : MediaLibraryService() {
             )
             player.seekTo(player.currentMediaItemIndex, position)
             player.prepare()
+            publishNerdStats()
             // Whatever the replacement wrote is a prefix of a file nothing will
             // ever finish, under a key the *next* upgrade of this track would
             // key to as well — see [AudioCache.discardRendition]. Off the main

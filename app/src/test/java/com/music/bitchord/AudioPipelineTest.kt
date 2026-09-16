@@ -10,6 +10,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runTest
 
 /**
  * Verification of the Audio Pipeline models, quality badge tier classification,
@@ -247,5 +250,235 @@ class AudioPipelineTest {
 
         assertEquals("Resampler", type)
         assertEquals("Resampled", quality)
+    }
+
+    // ── Dynamic & Authoritative Source Transitions ────────────────────────
+
+    @Test
+    fun `initial YouTube active sets source to YouTube`() {
+        val mediaId = "video-yt-1"
+        NerdStats.recordSource(mediaId, "YouTube")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/opus",
+            bitrateKbps = 160,
+            sampleRateHz = 48000,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        assertEquals("YouTube", NerdStats.sourceFor(mediaId))
+        assertEquals("YouTube", NerdStats.current.value?.sourceName)
+    }
+
+    @Test
+    fun `candidate stream resolved but not active leaves source unchanged`() {
+        val mediaId = "video-yt-1"
+        NerdStats.recordSource(mediaId, "YouTube")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/opus",
+            bitrateKbps = 160,
+            sampleRateHz = 48000,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        // Candidate discovered in background (e.g. QualityUpgrade.lookAgain returns SourceStream)
+        // Candidate resolution must NOT touch NerdStats.recordSource
+        val candidate = com.music.bitchord.data.sources.SourceStream(
+            url = "https://jiosaavn.cdn/song.flac",
+            format = StreamFormat(codec = "flac", bitDepth = 16, sampleRateHz = 44100),
+            sourceConfigId = "jiosaavn",
+        )
+
+        assertEquals("YouTube", NerdStats.sourceFor(mediaId))
+        assertEquals("YouTube", NerdStats.current.value?.sourceName)
+    }
+
+    @Test
+    fun `successful replacement updates active source immediately`() {
+        val mediaId = "video-yt-1"
+        NerdStats.recordSource(mediaId, "YouTube")
+
+        // Candidate swapped in
+        val candidate = com.music.bitchord.data.sources.SourceStream(
+            url = "https://jiosaavn.cdn/song.flac",
+            format = StreamFormat(codec = "flac", bitDepth = 16, sampleRateHz = 44100),
+            sourceConfigId = "jiosaavn",
+        )
+        val newSource = "JioSaavn"
+
+        NerdStats.onSourceStream(mediaId, candidate.format, newSource)
+        NerdStats.recordSource(mediaId, newSource)
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 1411,
+            sampleRateHz = 44100,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        assertEquals("JioSaavn", NerdStats.sourceFor(mediaId))
+        assertEquals("JioSaavn", NerdStats.current.value?.sourceName)
+    }
+
+    @Test
+    fun `chained replacement from JioSaavn to Addon updates active source`() {
+        val mediaId = "video-yt-1"
+        NerdStats.recordSource(mediaId, "JioSaavn")
+        assertEquals("JioSaavn", NerdStats.sourceFor(mediaId))
+
+        // Higher-tier Addon replacement succeeds
+        val addonSource = "Unified Addon"
+        val flacFormat = StreamFormat(codec = "flac", bitDepth = 24, sampleRateHz = 96000)
+        NerdStats.onSourceStream(mediaId, flacFormat, addonSource)
+        NerdStats.recordSource(mediaId, addonSource)
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 4608,
+            sampleRateHz = 96000,
+            channels = 2,
+            bitDepth = 24,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        assertEquals("Unified Addon", NerdStats.sourceFor(mediaId))
+        assertEquals("Unified Addon", NerdStats.current.value?.sourceName)
+    }
+
+    @Test
+    fun `failed or rejected replacement preserves previous active source`() {
+        val mediaId = "video-yt-1"
+        NerdStats.recordSource(mediaId, "YouTube")
+        val previousSource = NerdStats.sourceFor(mediaId)
+
+        // Audition fails or duration rejected before swap
+        // No swap happens -> previous source remains
+        assertEquals("YouTube", previousSource)
+        assertEquals("YouTube", NerdStats.sourceFor(mediaId))
+    }
+
+    @Test
+    fun `rollback after failed swap restores previous active source`() {
+        val mediaId = "video-yt-1"
+        NerdStats.recordSource(mediaId, "YouTube")
+        val previousSource = NerdStats.sourceFor(mediaId) ?: "YouTube"
+
+        // Swap attempted
+        NerdStats.onSourceStream(mediaId, StreamFormat(codec = "flac"), "JioSaavn")
+        NerdStats.recordSource(mediaId, "JioSaavn")
+        assertEquals("JioSaavn", NerdStats.sourceFor(mediaId))
+
+        // Replacement proved truncated during playback -> watchUpgrade reverts
+        NerdStats.clearDeclared(mediaId)
+        NerdStats.recordSource(mediaId, previousSource)
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/opus",
+            bitrateKbps = 160,
+            sampleRateHz = 48000,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        assertEquals("YouTube", NerdStats.sourceFor(mediaId))
+        assertEquals("YouTube", NerdStats.current.value?.sourceName)
+    }
+
+    @Test
+    fun `late async callback cannot overwrite active source`() {
+        val mediaId = "video-yt-1"
+        // JioSaavn won and is active
+        NerdStats.recordSource(mediaId, "JioSaavn")
+        val activeSource = NerdStats.sourceFor(mediaId)
+
+        // Slower background callback returns an addon candidate
+        val lateCandidate = com.music.bitchord.data.sources.SourceStream(
+            url = "https://addon.cdn/song.flac",
+            format = StreamFormat(codec = "flac"),
+            sourceConfigId = "slow-addon",
+        )
+        // Late candidate resolution without swap does not call recordSource
+        assertEquals("JioSaavn", activeSource)
+        assertEquals("JioSaavn", NerdStats.sourceFor(mediaId))
+    }
+
+    @Test
+    fun `track transition clears snapshot and prevents source leaking`() {
+        val track1 = "track-1"
+        val track2 = "track-2"
+
+        NerdStats.recordSource(track1, "JioSaavn")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 1411,
+            sampleRateHz = 44100,
+            channels = 2,
+            sourceName = "JioSaavn",
+        )
+        assertEquals("JioSaavn", NerdStats.sourceFor(track1))
+
+        // onTrackBecameCurrent clears snapshot across track advance
+        NerdStats.current.value = null
+        assertNull(NerdStats.current.value)
+
+        // Track 2 starts on YouTube
+        NerdStats.recordSource(track2, "YouTube")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/opus",
+            bitrateKbps = 160,
+            sampleRateHz = 48000,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(track2),
+        )
+
+        assertEquals("YouTube", NerdStats.sourceFor(track2))
+        assertEquals("YouTube", NerdStats.current.value?.sourceName)
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `already open audio pipeline observes active source change dynamically`() = runTest {
+        val mediaId = "track-dyn-1"
+        NerdStats.recordSource(mediaId, "YouTube")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/opus",
+            bitrateKbps = 160,
+            sampleRateHz = 48000,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        val observedSources = mutableListOf<String?>()
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            NerdStats.current.collect { snapshot ->
+                observedSources.add(snapshot?.sourceName)
+            }
+        }
+
+        assertEquals(listOf("YouTube"), observedSources)
+
+        // Quality swap occurs live while dialog is collecting StateFlow
+        NerdStats.recordSource(mediaId, "JioSaavn")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 1411,
+            sampleRateHz = 44100,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        assertEquals(listOf("YouTube", "JioSaavn"), observedSources)
+
+        // Subsequent upgrade to Addon
+        NerdStats.recordSource(mediaId, "Unified Addon")
+        NerdStats.current.value = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 4608,
+            sampleRateHz = 96000,
+            channels = 2,
+            sourceName = NerdStats.sourceFor(mediaId),
+        )
+
+        assertEquals(listOf("YouTube", "JioSaavn", "Unified Addon"), observedSources)
+        job.cancel()
     }
 }
